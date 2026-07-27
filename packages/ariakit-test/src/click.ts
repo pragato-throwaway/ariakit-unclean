@@ -1,0 +1,217 @@
+import { isVisible, isFocusable, invariant } from "@ariakit/utils";
+import { isHappyDOM, settle, wrapAsync } from "./__utils.ts";
+import { dispatch } from "./dispatch.ts";
+import { focus } from "./focus.ts";
+import { hover } from "./hover.ts";
+import { mouseDown } from "./mouse-down.ts";
+import { mouseUp } from "./mouse-up.ts";
+import { sleep } from "./sleep.ts";
+
+function getClosestLabel(element: Element) {
+  if (!isFocusable(element)) {
+    return element.closest("label");
+  }
+  return null;
+}
+
+function getInputFromLabel(element: HTMLLabelElement) {
+  const input = element.htmlFor
+    ? element.ownerDocument?.getElementById(element.htmlFor)
+    : element.querySelector("input,textarea,select");
+
+  return input as
+    | HTMLInputElement
+    | HTMLTextAreaElement
+    | HTMLSelectElement
+    | null
+    | undefined;
+}
+
+async function clickLabel(element: HTMLLabelElement, options?: MouseEventInit) {
+  const input = getInputFromLabel(element);
+  const isInputDisabled = Boolean(input?.disabled);
+
+  if (input) {
+    // JSDOM will automatically "click" input right after we "click" the label.
+    // Since we need to "focus" it first, we temporarily disable it so it won't
+    // get automatically clicked.
+    input.disabled = true;
+  }
+
+  const defaultAllowed = await dispatch.click(element, options);
+
+  if (input) {
+    // Now we can revert input disabled state and fire events on it in the
+    // right order.
+    input.disabled = isInputDisabled;
+    if (defaultAllowed && isFocusable(input)) {
+      await focus(input);
+      // Only "click" is fired! Browsers don't go over the whole event stack in
+      // this case (mousedown, mouseup etc.).
+      await dispatch.click(input);
+    }
+  }
+}
+
+function setSelected(element: HTMLOptionElement, selected: boolean) {
+  // User interaction changes selectedness, not default selectedness.
+  element.selected = selected;
+}
+
+// WHY: happy-dom caches `select.selectedOptions` from the internal
+// `querySelectorAll("option")` result and does not invalidate it when only
+// `option.selected` changes. Real browsers and jsdom expose a live collection.
+// The former `selected` attribute write cleared this cache as a side effect;
+// now selection changes only update IDL selectedness, so clear happy-dom's
+// query cache explicitly before dispatching events.
+function clearHappyDOMSelectCache(element: HTMLSelectElement) {
+  if (!isHappyDOM()) return;
+  let prototype: object | null = element;
+  while (prototype) {
+    const clearCacheSymbol = Object.getOwnPropertySymbols(prototype).find(
+      (symbol) => symbol.description === "clearCache",
+    );
+    if (clearCacheSymbol) {
+      const clearCache: unknown = Reflect.get(element, clearCacheSymbol);
+      if (typeof clearCache === "function") {
+        clearCache.call(element);
+      }
+      return;
+    }
+    prototype = Object.getPrototypeOf(prototype);
+  }
+}
+
+async function clickOption(
+  element: HTMLOptionElement,
+  eventOptions?: MouseEventInit,
+) {
+  // https://stackoverflow.com/a/16530782/5513909
+  const select = element.closest("select") as HTMLSelectElement & {
+    lastOptionSelectedNotByShiftKey?: HTMLOptionElement;
+  };
+
+  if (!select) {
+    await dispatch.click(element, eventOptions);
+    return;
+  }
+
+  if (select.multiple) {
+    const options = Array.from(select.options);
+    const resetOptions = () => {
+      for (const option of options) {
+        setSelected(option, false);
+      }
+    };
+    const selectRange = (a: number, b: number) => {
+      const from = Math.min(a, b);
+      const to = Math.max(a, b) + 1;
+      const selectedOptions = options.slice(from, to);
+      for (const option of selectedOptions) {
+        setSelected(option, true);
+      }
+    };
+
+    if (eventOptions?.shiftKey) {
+      const elementIndex = options.indexOf(element);
+      const referenceOption =
+        select.lastOptionSelectedNotByShiftKey ??
+        options.find((option) => option.selected);
+      const referenceOptionIndex = referenceOption
+        ? options.indexOf(referenceOption)
+        : -1;
+
+      resetOptions();
+      // Select options between the clicked element and the reference option,
+      // anchoring at the clicked element when there is no usable reference.
+      selectRange(
+        elementIndex,
+        referenceOptionIndex === -1 ? elementIndex : referenceOptionIndex,
+      );
+
+      setSelected(element, true);
+    } else {
+      // Keep track of this option as this will be used later when shift key
+      // is used.
+      select.lastOptionSelectedNotByShiftKey = element;
+
+      if (eventOptions?.ctrlKey) {
+        // Clicking with ctrlKey will select/deselect the option
+        setSelected(element, !element.selected);
+      } else {
+        // Simply clicking an option will select only that option
+        resetOptions();
+        setSelected(element, true);
+      }
+    }
+  } else {
+    setSelected(element, true);
+  }
+
+  clearHappyDOMSelectCache(select);
+  await dispatch.input(select);
+  await dispatch.change(select);
+  await dispatch.click(element, eventOptions);
+}
+
+/**
+ * Clicks on an element, simulating the sequence of events a real mouse click
+ * produces — hovering the target, then `pointerdown`, `mousedown`, `focus`,
+ * `pointerup`, `mouseup`, and `click`.
+ *
+ * Hidden and disabled elements are handled the same way a browser would, and
+ * clicks on labels, `option` elements, and form controls behave like native
+ * interactions. Pass `options` to set event properties such as modifier keys
+ * (e.g. `{ shiftKey: true }`).
+ * @example
+ * ```ts
+ * await click(q.button("Submit"));
+ * // With a modifier key held down:
+ * await click(q.option("Item"), { shiftKey: true });
+ * ```
+ */
+export function click(
+  element: Element | null,
+  options?: PointerEventInit,
+  tap = false,
+) {
+  return wrapAsync(async () => {
+    invariant(element, "Unable to click on null element");
+    if (!isVisible(element)) return;
+
+    await hover(element, options);
+    await mouseDown(element, options);
+
+    // The element may be hidden after hover/mouseDown, so we need to check again
+    // and find the first visible parent.
+    while (!isVisible(element)) {
+      if (!element.parentElement) return;
+      element = element.parentElement;
+    }
+
+    if (!tap) {
+      // Press-and-release dwell between mouseDown and mouseUp: let work scheduled
+      // on pointer/mouse down flush (microtask/rAF) before releasing, without a
+      // wall-clock delay. The final settle below keeps the real timer.
+      await settle();
+    }
+
+    await mouseUp(element, options);
+
+    // click is not called on disabled elements
+    const { disabled } = element as HTMLButtonElement;
+    if (disabled) return;
+
+    const label = getClosestLabel(element);
+
+    if (label) {
+      await clickLabel(label, { detail: 1, ...options });
+    } else if (element instanceof HTMLOptionElement) {
+      await clickOption(element, { detail: 1, ...options });
+    } else {
+      await dispatch.click(element, { detail: 1, ...options });
+    }
+
+    await sleep();
+  });
+}

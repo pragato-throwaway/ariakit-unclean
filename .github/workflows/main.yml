@@ -1,0 +1,204 @@
+name: main
+
+on:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up environment
+        uses: ./.github/workflows/setup
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Lint CSS
+        run: pnpm run lint-css
+
+  typescript:
+    name: Type check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up environment
+        uses: ./.github/workflows/setup
+
+      - name: Type check
+        run: pnpm run tsc -v
+
+  build:
+    name: Build packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up environment
+        uses: ./.github/workflows/setup
+
+      - name: Build
+        run: pnpm run build
+
+  test:
+    name: "Test${{ matrix.name && format(' {0}', matrix.name) || '' }}${{ matrix.shard && format(' ({0})', matrix.shard) || '' }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: test
+          - name: React
+            script: test-react
+          # Runs unsharded on happy-dom (fast). The Test step still honors a
+          # `shard:` key, so split it again by re-adding `shard: "1/2"` and
+          # `shard: "2/2"` entries here if it ever slows down.
+          - name: React 18
+            script: test-react18
+          - name: Solid
+            script: test-solid
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up environment
+        uses: ./.github/workflows/setup
+
+      - name: Test
+        env:
+          TEST_SCRIPT: ${{ matrix.script }}
+          TEST_SHARD: ${{ matrix.shard }}
+        run: |
+          if [ -n "$TEST_SHARD" ]; then
+            pnpm "$TEST_SCRIPT" --shard "$TEST_SHARD"
+          else
+            pnpm "$TEST_SCRIPT"
+          fi
+
+  website:
+    name: Build website
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up environment
+        uses: ./.github/workflows/setup
+
+      - name: Build website
+        run: pnpm run build-website-lite
+
+      - name: Upload website artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: website-dist
+          path: website/.next
+          retention-days: 7
+          include-hidden-files: true
+
+  test-chrome:
+    name: Test ${{ matrix.name }}
+    needs: website
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Chrome
+            engine: chromium
+            project: chrome
+          - name: Android
+            engine: chromium
+            project: android
+          - name: Firefox
+            engine: firefox
+            project: firefox
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Set up environment
+        uses: ./.github/workflows/setup
+
+      - name: Install Playwright
+        uses: ./.github/workflows/install-playwright
+        with:
+          engine: ${{ matrix.engine }}
+
+      - name: Download website artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: website-dist
+          path: website/.next
+
+      - name: Test
+        id: test
+        run: xvfb-run pnpm run playwright --project ${{ matrix.project }}
+
+      - name: Upload test results to GitHub
+        if: failure() && steps.test.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.project }}-test-results
+          path: test-results
+          retention-days: 30
+
+  test-macos:
+    name: Test macOS
+    needs: website
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    # concurrency:
+    #   group: test-macos-${{ github.head_ref || github.run_id }}
+    #   cancel-in-progress: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Set up environment
+        uses: ./.github/workflows/setup
+
+      - name: Install playwright
+        uses: ./.github/workflows/install-playwright
+        with:
+          engine: webkit
+
+      - name: Download website artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: website-dist
+          path: website/.next
+
+      - name: Test
+        id: test
+        run: pnpm run playwright --project safari --project ios
+
+      - name: Upload test results to GitHub
+        if: failure() && steps.test.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: safari-test-results
+          path: test-results
+          retention-days: 30

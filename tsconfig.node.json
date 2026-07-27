@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": ["**/*", ".changeset/*.ts"],
+  "exclude": [
+    "website",
+    "app",
+    "examples",
+    "packages",
+    "nextjs",
+    "coverage",
+    "templates/*/dist"
+  ]
+}
